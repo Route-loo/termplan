@@ -3,9 +3,14 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template, request
+# 引入 OpenAI SDK 用以调用 NVIDIA NIM 接口
+from openai import OpenAI
 
 app = Flask(__name__)
 DB_PATH = os.path.expanduser("~/Desktop/termplan/termplan.db")
+
+# 从环境变量中读取 NVIDIA API KEY
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
 
 
 def get_db_connection():
@@ -150,54 +155,83 @@ def punch():
         return jsonify({"status": "error", "msg": str(e)})
 
 
-# --- 新增：开题报告核心规划——AI 备考心理疏导对话引擎 ---
+# --- 核心升级：对接 NVIDIA 大模型 API 的自适应智能对话引擎 ---
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.json
     user_msg = data.get("message", "").strip()
 
-    conn = get_db_connection()
-    exams = conn.execute(
-        "SELECT subject, weight, ddl, CAST((julianday(ddl) - julianday('now', 'localtime')) AS INT) as days_left FROM exams"
-    ).fetchall()
-    punches = conn.execute(
-        "SELECT subject, COUNT(*) FROM punch_history WHERE punch_date >= date('now', '-7 days') GROUP BY subject"
-    ).fetchall()
-    conn.close()
+    if not user_msg:
+        return jsonify({"status": "error", "msg": "写下的困惑不能为空白哦"})
 
-    punch_dict = {p[0]: p[1] for p in punches}
+    # 1. 动态读取本地数据库，抽取复习备考的真实数据作为 AI 上下文
+    try:
+        conn = get_db_connection()
+        exams = conn.execute(
+            "SELECT subject, weight, ddl, CAST((julianday(ddl) - julianday('now', 'localtime')) AS INT) as days_left FROM exams"
+        ).fetchall()
+        punches = conn.execute(
+            "SELECT subject, COUNT(*) as cnt FROM punch_history WHERE punch_date >= date('now', '-7 days') GROUP BY subject"
+        ).fetchall()
+        conn.close()
 
-    # 动态分析计算目前压力载荷最高的科目（压迫指数 = 权重 * 10 / (剩余天数 * 打卡率)）
-    urgent_sub, max_stress = None, -1
+        punch_dict = {p["subject"]: p["cnt"] for p in punches}
+    except Exception as e:
+        exams, punch_dict = [], {}
+
+    # 将数据库状态组织成结构化文本
+    context_lines = []
     for e in exams:
-        days = max(1, e["days_left"])
-        recent = punch_dict.get(e["subject"], 0)
-        stress = (e["weight"] * 10) / (days * (recent + 1))
-        if stress > max_stress:
-            max_stress = stress
-            urgent_sub = {"name": e["subject"], "days": days, "cnt": recent}
+        sub = e["subject"]
+        days = max(0, e["days_left"])
+        recent = punch_dict.get(sub, 0)
+        weight = e["weight"]
+        # 计算紧迫度指数帮助大模型抓取痛点
+        stress = (weight * 10) / (max(1, days) * (recent + 1))
+        status = "🔥 极度危险/急需攻坚" if stress > 5.0 else ("⚠️ 进度偏慢" if stress > 2.0 else "✅ 节奏良好")
+        context_lines.append(
+            f"- 科目: {sub} | 难度权重: {weight} | 距离考试剩 {days} 天 | 近一周心流打卡: {recent} 次 | 状态评估: {status}"
+        )
 
-    # 上下文感知与智能化情绪应答逻辑
-    if (
-        "焦虑" in user_msg
-        or "压力" in user_msg
-        or "学不完" in user_msg
-        or "慌" in user_msg
-    ):
-        if urgent_sub:
-            reply = f"检测到你的心理波形由于【{urgent_sub['name']}】出现严重扰动。当前该科目考期仅剩 {urgent_sub['days']} 天，近一周量化打卡仅 {urgent_sub['cnt']} 次。请注意，焦虑是高级智力对未知危机的防御机制。现在听我指令：切断一切外部高熵干扰，进入控制台启动一个 25 分钟的无扰打卡。行动是重构崩溃秩序的唯一解药。"
-        else:
-            reply = "当前外部监控集群显示并无极端倒计时威胁。备考期间的心理波动属于正常的认知过载。建议执行一个‘线程挂起’操作：离开座位，深呼吸，去喝杯水。你的底层架构非常优秀，允许存在 Warning，但不必让它演变成 Fatal Error。"
-    elif "规划" in user_msg or "怎么复习" in user_msg or "建议" in user_msg:
-        if urgent_sub:
-            reply = f"【系统智能排程推荐】：建议立刻将 70% 的计算资源向【{urgent_sub['name']}】倾斜。由于其剩余天数短且近期活跃度低下，当前处于红区载荷状态。推荐策略：摒弃大块复习幻想，拆解成 3 个 20 分钟的小型进程流，在左侧控制台分步打卡，拉平风险曲线。"
-        else:
-            reply = "当前各科目负载均衡，系统运行良好。建议采用‘时间片轮转算法’：每门科目依次无扰打卡 30 分钟，保持全科神经元的整体活跃度，避免单一科目长期挂起。"
-    else:
-        if urgent_sub:
-            reply = f"信号已接收。我一直在后台维护你的备考数据流，目前看【{urgent_sub['name']}】的压迫指数最高。无论你遇到了技术瓶颈还是情绪低谷，都可以在这里随时向我呼叫。需要现在为【{urgent_sub['name']}】开启一轮专注打卡吗？"
-        else:
-            reply = "AI 心理调度终端处于就绪状态，未检测到极端异常。你可以向我咨询复习规划，或者在这里倾诉备考中的负面情绪。系统随时为你提供高弹性的策略缓冲。"
+    student_context = "\n".join(context_lines) if context_lines else "目前大盘很整洁，没有部署任何期末考试科目。"
+
+    # 2. 检查环境变量配置
+    if not NVIDIA_API_KEY:
+        return jsonify({
+            "status": "success",
+            "reply": "✨ 顾问提示：检测到您的后端尚未检测到环境变量 NVIDIA_API_KEY。请在终端执行相关配置后再启动本系统。"
+        })
+
+    # 3. 注入符合 TermPlan 极简、静谧、莫兰迪美学风格的系统提示词 (System Prompt)
+    system_prompt = (
+        "你是一个集成在极简复习软件 'TermPlan' 中的自适应 AI 顾问。\n"
+        "你的职责是根据学生当下的情绪/困惑，结合其后台真实的复习进度，提供温柔、平和、具有安抚感且切实可行的排程和复习建议。\n"
+        "【请遵守以下语气与人设规范】：\n"
+        "1. 你的说话风格应像莫兰迪色系一样偏向静谧、沉稳、解压，多用‘轻轻放下’、‘理清步调’、‘建立节奏流’等温和词汇，严禁机械敷衍，严禁使用傲慢的说教口吻。\n"
+        "2. 不要主动在对话里提及‘数据库’、‘代码’或‘底层逻辑’等词汇，要将数据不动声色地融进你的关怀和备考建议中。\n\n"
+        f"【当前学生的真实备考数据流如下】:\n{student_context}\n\n"
+        "请根据上述数据流和用户的发言，给出一共不超过 250 字的精致回复。"
+    )
+
+    # 4. 请求 NVIDIA API 接口
+    try:
+        client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=NVIDIA_API_KEY
+        )
+        # 推荐使用 meta/llama-3.1-70b-instruct
+        completion = client.chat.completions.create(
+            model="meta/llama-3.1-70b-instruct",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg}
+            ],
+            temperature=0.6,
+            max_tokens=512,
+        )
+        reply = completion.choices[0].message.content.strip()
+    except Exception as e:
+        reply = f"✨ 顾问在冥想中开小差了（API 调用失败）: {str(e)}"
 
     return jsonify({"status": "success", "reply": reply})
 
